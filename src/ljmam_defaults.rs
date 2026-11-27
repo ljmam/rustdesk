@@ -12,7 +12,7 @@ pub fn apply() {
         (keys::OPTION_API_SERVER, "http://rust.ljmam.com"),
         (
             keys::OPTION_KEY,
-            "X7cyME6Ro9s18xTI8ePwIvnOmZL5Zhy6lXeUigFjJZE=",
+            "qauvjOfkbL1OnZsvwTe71HGrEdsVK1iVolDKT7QXZlI=",
         ),
     ] {
         defaults
