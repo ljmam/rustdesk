@@ -33,7 +33,7 @@ jobs:
           key: hbbs-account-handshake-musl
       - name: Test handshake and compatibility
         working-directory: server
-        run: cargo test --locked --lib handshake:: -- --nocapture
+        run: 'cargo test --locked --lib handshake:: -- --nocapture'
       - name: Build static Synology binaries
         working-directory: server
         env:
