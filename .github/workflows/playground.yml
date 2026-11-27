@@ -39,10 +39,12 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          RUSTFLAGS: -C target-feature=+crt-static -C relocation-model=static -C link-arg=-static
         run: cargo build --locked --release --target x86_64-unknown-linux-musl --bin hbbs --bin hbbr
       - name: Verify static binaries
         run: |
           file server/target/x86_64-unknown-linux-musl/release/hbbs
+          if readelf -l server/target/x86_64-unknown-linux-musl/release/hbbs | grep -q INTERP; then exit 1; fi
           server/target/x86_64-unknown-linux-musl/release/hbbs --version
           server/target/x86_64-unknown-linux-musl/release/hbbr --version
       - uses: actions/upload-artifact@v4
