@@ -20,7 +20,7 @@ index 9c76f41..cb41c42 100644
 +}
 diff --git a/src/handshake.rs b/src/handshake.rs
 new file mode 100644
-index 0000000..05d1f28
+index 0000000..e6abd9b
 --- /dev/null
 +++ b/src/handshake.rs
 @@ -0,0 +1,284 @@
@@ -71,8 +71,7 @@ index 0000000..05d1f28
 +
 +impl Codec {
 +    fn new() -> Self {
-+        let mut framing = BytesCodec::new();
-+        framing.set_max_packet_length(1024 * 1024);
++        let framing = BytesCodec::new();
 +        Self {
 +            framing,
 +            encryption: None,
@@ -148,6 +147,7 @@ index 0000000..05d1f28
 +    let Some(signer) = signer else {
 +        return Ok((conn, None));
 +    };
++    conn.codec_mut().framing.set_max_packet_length(1024 * 1024);
 +    let (mut pk, sk) = box_::gen_keypair();
 +    // The signed marker requires version parameters to be authenticated by new clients.
 +    pk.0[31] |= 0x80;
