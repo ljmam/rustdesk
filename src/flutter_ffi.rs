@@ -3084,6 +3084,7 @@ pub mod server_side {
         custom_client_config: JString,
     ) {
         log::debug!("startServer from jvm");
+        crate::ljmam_defaults::apply();
         // Started at boot, the service runs without the Flutter side and its `initialize`.
         crate::common::init_sodium();
         let mut env = env;
