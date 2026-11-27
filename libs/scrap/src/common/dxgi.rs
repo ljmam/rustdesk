@@ -38,6 +38,14 @@ impl Capturer {
     pub fn height(&self) -> usize {
         self.height
     }
+
+    /// Check DXGI access without reading pixels; an unchanged desktop may return WouldBlock.
+    pub fn probe_frame(&mut self) -> io::Result<()> {
+        match self.inner.probe_frame() {
+            Err(ref error) if error.kind() == TimedOut => Err(WouldBlock.into()),
+            result => result,
+        }
+    }
 }
 
 impl TraitCapturer for Capturer {
@@ -70,22 +78,29 @@ impl TraitCapturer for Capturer {
 
 pub struct PixelBuffer<'a> {
     data: &'a [u8],
+    pixfmt: Pixfmt,
     width: usize,
     height: usize,
     stride: Vec<usize>,
 }
 
 impl<'a> PixelBuffer<'a> {
-    pub fn new(data: &'a [u8], width: usize, height: usize) -> Self {
+    pub fn new(data: &'a [u8], pixfmt: Pixfmt, width: usize, height: usize) -> Self {
         let stride0 = data.len() / height;
         let mut stride = Vec::new();
         stride.push(stride0);
         PixelBuffer {
             data,
+            pixfmt,
             width,
             height,
             stride,
         }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn with_BGRA(data: &'a [u8], width: usize, height: usize) -> Self {
+        Self::new(data, Pixfmt::BGRA, width, height)
     }
 }
 
@@ -107,7 +122,7 @@ impl<'a> crate::TraitPixelBuffer for PixelBuffer<'a> {
     }
 
     fn pixfmt(&self) -> Pixfmt {
-        Pixfmt::BGRA
+        self.pixfmt
     }
 }
 
@@ -125,7 +140,15 @@ impl Display {
             .map(Display)
             .collect::<Vec<_>>();
 
-        let displays_dxgi = Self::all_().unwrap_or(Default::default());
+        let mut displays_dxgi = match Self::all_() {
+            Ok(displays) => displays,
+            Err(e) => {
+                hbb_common::log::error!("DXGI display enumeration failed: {e}");
+                Vec::new()
+            }
+        };
+        // Win+P "Show only on 1/2" still enumerates detached DXGI outputs.
+        displays_dxgi.retain(|d| d.is_online() && d.width() > 0 && d.height() > 0);
 
         // Return gdi displays if dxgi is not supported
         if displays_dxgi.is_empty() {
@@ -148,7 +171,6 @@ impl Display {
         }
 
         // Reorder displays from dxgi
-        let mut displays_dxgi = displays_dxgi;
         let mut displays_dxgi_ordered = Vec::new();
         for name in names_gdi.iter() {
             let pos = match displays_dxgi.iter().position(|d| d.name() == *name) {
@@ -169,11 +191,11 @@ impl Display {
     }
 
     pub fn width(&self) -> usize {
-        self.0.width() as usize
+        self.0.width().max(0) as usize
     }
 
     pub fn height(&self) -> usize {
-        self.0.height() as usize
+        self.0.height().max(0) as usize
     }
 
     pub fn name(&self) -> String {
@@ -194,7 +216,8 @@ impl Display {
 
     pub fn is_primary(&self) -> bool {
         // https://docs.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-devmodea
-        self.origin() == (0, 0)
+        // Detached outputs can still report origin (0,0) with a zero size.
+        self.origin() == (0, 0) && self.width() > 0 && self.height() > 0
     }
 
     #[cfg(feature = "vram")]
@@ -232,7 +255,7 @@ impl CapturerMag {
 impl TraitCapturer for CapturerMag {
     fn frame<'a>(&'a mut self, _timeout_ms: Duration) -> io::Result<Frame<'a>> {
         self.inner.frame(&mut self.data)?;
-        Ok(Frame::PixelBuffer(PixelBuffer::new(
+        Ok(Frame::PixelBuffer(PixelBuffer::with_BGRA(
             &self.data,
             self.inner.get_rect().1,
             self.inner.get_rect().2,

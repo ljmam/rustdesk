@@ -9,6 +9,7 @@ import 'package:flutter/material.dart' hide TabBarTheme;
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/remote_page.dart';
+import 'package:flutter_hbb/desktop/pages/view_camera_page.dart';
 import 'package:flutter_hbb/main.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
@@ -51,7 +52,9 @@ enum DesktopTabType {
   cm,
   remoteScreen,
   fileTransfer,
+  viewCamera,
   portForward,
+  terminal,
   install,
 }
 
@@ -96,6 +99,7 @@ class DesktopTabController {
   /// index, key
   Function(int, String)? onRemoved;
   Function(String)? onSelected;
+  Future<void> Function()? onCloseWindow;
 
   DesktopTabController(
       {required this.tabType, this.onRemoved, this.onSelected});
@@ -179,11 +183,13 @@ class DesktopTabController {
       jumpTo(state.value.tabs.indexWhere((tab) => tab.key == key),
           callOnSelected: callOnSelected);
 
-  bool jumpToByKeyAndDisplay(String key, int display) {
+  bool jumpToByKeyAndDisplay(String key, int display, {bool isCamera = false}) {
     for (int i = 0; i < state.value.tabs.length; i++) {
       final tab = state.value.tabs[i];
       if (tab.key == key) {
-        final ffi = (tab.page as RemotePage).ffi;
+        final ffi = isCamera
+            ? (tab.page as ViewCameraPage).ffi
+            : (tab.page as RemotePage).ffi;
         if (ffi.ffiModel.pi.currentDisplay == display) {
           return jumpTo(i, callOnSelected: true);
         }
@@ -287,7 +293,6 @@ class DesktopTab extends StatefulWidget {
 // ignore: must_be_immutable
 class _DesktopTabState extends State<DesktopTab>
     with MultiWindowListener, WindowListener {
-  final _saveFrameDebounce = Debouncer(delay: Duration(seconds: 1));
   Timer? _macOSCheckRestoreTimer;
   int _macOSCheckRestoreCounter = 0;
 
@@ -365,7 +370,7 @@ class _DesktopTabState extends State<DesktopTab>
 
   void _setMaximized(bool maximize) {
     stateGlobal.setMaximized(maximize);
-    _saveFrameDebounce.call(_saveFrame);
+    _saveFrame();
     setState(() {});
   }
 
@@ -382,7 +387,10 @@ class _DesktopTabState extends State<DesktopTab>
   @override
   void onWindowMinimize() {
     stateGlobal.setMinimized(true);
-    stateGlobal.setMaximized(false);
+    // GTK preserves maximization and may restore without a maximize event.
+    if (!isLinux) {
+      stateGlobal.setMaximized(false);
+    }
     super.onWindowMinimize();
   }
 
@@ -400,24 +408,36 @@ class _DesktopTabState extends State<DesktopTab>
     super.onWindowUnmaximize();
   }
 
-  _saveFrame() async {
-    if (tabType == DesktopTabType.main) {
-      await saveWindowPosition(WindowType.Main);
-    } else if (kWindowType != null && kWindowId != null) {
-      await saveWindowPosition(kWindowType!, windowId: kWindowId);
+  _saveFrame({bool? flush}) async {
+    try {
+      if (tabType == DesktopTabType.main) {
+        await saveWindowPosition(WindowType.Main, flush: flush);
+      } else if (kWindowType != null && kWindowId != null) {
+        await saveWindowPosition(kWindowType!,
+            windowId: kWindowId, flush: flush);
+      }
+    } catch (e) {
+      debugPrint('Error saving window position: $e');
     }
   }
 
+  // On Linux, GTK destroys the window on a close request unless prevent-close
+  // is on. It is off for the cm and install windows, and onActiveWindowChanged()
+  // turns it off to quit, so the window can no longer be saved or hidden.
+  // https://github.com/rustdesk/rustdesk/issues/16512
+  Future<bool> _isLinuxWindowClosed() async =>
+      isLinux && isMainWindow && !await windowManager.isPreventClose();
+
   @override
   void onWindowMoved() {
-    _saveFrameDebounce.call(_saveFrame);
+    _saveFrame();
     super.onWindowMoved();
   }
 
   @override
   void onWindowResized() {
-    _saveFrameDebounce.call(_saveFrame);
-    super.onWindowMoved();
+    _saveFrame();
+    super.onWindowResized();
   }
 
   @override
@@ -455,11 +475,16 @@ class _DesktopTabState extends State<DesktopTab>
       });
     }
 
+    if (await _isLinuxWindowClosed()) return;
+
+    await _saveFrame(flush: true);
+
     // hide window on close
     if (isMainWindow) {
       if (rustDeskWinManager.getActiveWindows().contains(kMainWindowId)) {
         await rustDeskWinManager.unregisterActiveWindow(kMainWindowId);
       }
+      if (await _isLinuxWindowClosed()) return;
       // macOS specific workaround, the window is not hiding when in fullscreen.
       if (isMacOS && await windowManager.isFullScreen()) {
         await windowManager.setFullScreen(false);
@@ -581,14 +606,13 @@ class _DesktopTabState extends State<DesktopTab>
   }
 
   Widget _buildBar() {
+    final isIncomingHomePage = bind.isIncomingOnly() && isInHomePage();
     return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
         Expanded(
             child: GestureDetector(
                 // custom double tap handler
-                onTap: !(bind.isIncomingOnly() && isInHomePage()) &&
-                        showMaximize
+                onTap: !isIncomingHomePage && showMaximize
                     ? () {
                         final current = DateTime.now().millisecondsSinceEpoch;
                         final elapsed = current - _lastClickTime;
@@ -599,7 +623,7 @@ class _DesktopTabState extends State<DesktopTab>
                               .then((value) => stateGlobal.setMaximized(value));
                         }
                       }
-                    : null,
+                    : (isIncomingHomePage ? () {} : null), // Keep tap recognizer for Windows touch.
                 onPanStart: (_) => startDragging(isMainWindow),
                 onPanCancel: () {
                   // We want to disable dragging of the tab area in the tab bar.
@@ -647,7 +671,9 @@ class _DesktopTabState extends State<DesktopTab>
                                     controller.state.value.scrollController;
                                 if (!sc.canScroll) return;
                                 _scrollDebounce.call(() {
-                                  sc.animateTo(sc.offset + e.scrollDelta.dy,
+                                  double adjust = 2.5;
+                                  sc.animateTo(
+                                      sc.offset + e.scrollDelta.dy * adjust,
                                       duration: Duration(milliseconds: 200),
                                       curve: Curves.ease);
                                 });
@@ -725,6 +751,7 @@ class WindowActionPanelState extends State<WindowActionPanel> {
     return widget.tabController.state.value.tabs.length > 1 &&
         (widget.tabController.tabType == DesktopTabType.remoteScreen ||
             widget.tabController.tabType == DesktopTabType.fileTransfer ||
+            widget.tabController.tabType == DesktopTabType.viewCamera ||
             widget.tabController.tabType == DesktopTabType.portForward ||
             widget.tabController.tabType == DesktopTabType.cm);
   }
@@ -1071,11 +1098,12 @@ class _TabState extends State<_Tab> with RestorationMixin {
       return ConstrainedBox(
           constraints: BoxConstraints(maxWidth: widget.maxLabelWidth ?? 200),
           child: Tooltip(
-            message: widget.tabType == DesktopTabType.main
-                ? ''
-                : translate(widget.label.value),
+            message:
+                widget.tabType == DesktopTabType.main ? '' : widget.label.value,
             child: Text(
-              translate(widget.label.value),
+              widget.tabType == DesktopTabType.main
+                  ? translate(widget.label.value)
+                  : widget.label.value,
               textAlign: TextAlign.center,
               style: TextStyle(
                   color: isSelected

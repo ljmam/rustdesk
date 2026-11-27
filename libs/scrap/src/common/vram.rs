@@ -5,19 +5,19 @@ use std::{
 };
 
 use crate::{
-    codec::{base_bitrate, enable_vram_option, EncoderApi, EncoderCfg},
+    codec::{enable_vram_option, EncoderApi, EncoderCfg},
     hwcodec::HwCodecConfig,
     AdapterDevice, CodecFormat, EncodeInput, EncodeYuvFormat, Pixfmt,
 };
+use base::message_proto::{EncodedVideoFrame, EncodedVideoFrames, VideoFrame};
 use hbb_common::{
     anyhow::{anyhow, bail, Context},
     bytes::Bytes,
-    log,
-    message_proto::{EncodedVideoFrame, EncodedVideoFrames, VideoFrame},
-    ResultType,
+    log, ResultType,
 };
+pub use hwcodec::common::Driver;
 use hwcodec::{
-    common::{DataFormat, Driver, MAX_GOP},
+    common::{DataFormat, MAX_GOP},
     vram::{
         decode::{self, DecodeFrame, Decoder},
         encode::{self, EncodeFrame, Encoder},
@@ -25,13 +25,16 @@ use hwcodec::{
     },
 };
 
+#[cfg(test)]
+mod repeat_tests;
+
 // https://www.reddit.com/r/buildapc/comments/d2m4ny/two_graphics_cards_two_monitors/
 // https://www.reddit.com/r/techsupport/comments/t2v9u6/dual_monitor_setup_with_dual_gpu/
 // https://cybersided.com/two-monitors-two-gpus/
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-getadapterluid#remarks
 lazy_static::lazy_static! {
-    static ref ENOCDE_NOT_USE: Arc<Mutex<HashMap<usize, bool>>> = Default::default();
-    static ref FALLBACK_GDI_DISPLAYS: Arc<Mutex<HashSet<usize>>> = Default::default();
+    static ref ENOCDE_NOT_USE: Arc<Mutex<HashMap<String, bool>>> = Default::default();
+    static ref FALLBACK_GDI_DISPLAYS: Arc<Mutex<HashSet<String>>> = Default::default();
 }
 
 #[derive(Debug, Clone)]
@@ -49,8 +52,6 @@ pub struct VRamEncoder {
     pub format: DataFormat,
     ctx: EncodeContext,
     bitrate: u32,
-    last_frame_len: usize,
-    same_bad_len_counter: usize,
 }
 
 impl EncoderApi for VRamEncoder {
@@ -84,8 +85,6 @@ impl EncoderApi for VRamEncoder {
                         ctx,
                         format: config.feature.data_format,
                         bitrate,
-                        last_frame_len: 0,
-                        same_bad_len_counter: 0,
                     }),
                     Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
                 }
@@ -98,8 +97,16 @@ impl EncoderApi for VRamEncoder {
         &mut self,
         frame: EncodeInput,
         ms: i64,
-    ) -> ResultType<hbb_common::message_proto::VideoFrame> {
-        let (texture, rotation) = frame.texture()?;
+    ) -> ResultType<base::message_proto::VideoFrame> {
+        #[cfg(all(windows, feature = "vram"))]
+        let repeated = matches!(&frame, EncodeInput::Repeat);
+        #[cfg(not(all(windows, feature = "vram")))]
+        let repeated = false;
+        let (texture, rotation) = if repeated {
+            (std::ptr::null_mut(), 0)
+        } else {
+            frame.texture()?
+        };
         if rotation != 0 {
             // to-do: support rotation
             // Both the encoder and display(w,h) information need to be changed.
@@ -107,10 +114,12 @@ impl EncoderApi for VRamEncoder {
         }
         let mut vf = VideoFrame::new();
         let mut frames = Vec::new();
-        for frame in self
-            .encode(texture, ms)
-            .with_context(|| "Failed to encode")?
-        {
+        let result = if repeated {
+            self.encode_repeat(ms)
+        } else {
+            self.encode(texture, ms)
+        };
+        for frame in result.with_context(|| "Failed to encode")? {
             frames.push(EncodedVideoFrame {
                 data: Bytes::from(frame.data),
                 pts: frame.pts,
@@ -118,26 +127,10 @@ impl EncoderApi for VRamEncoder {
                 ..Default::default()
             });
         }
+        if repeated && frames.is_empty() {
+            return Ok(vf);
+        }
         if frames.len() > 0 {
-            // This kind of problem is occurred after a period of time when using AMD encoding,
-            // the encoding length is fixed at about 40, and the picture is still
-            const MIN_BAD_LEN: usize = 100;
-            const MAX_BAD_COUNTER: usize = 30;
-            let this_frame_len = frames[0].data.len();
-            if this_frame_len < MIN_BAD_LEN && this_frame_len == self.last_frame_len {
-                self.same_bad_len_counter += 1;
-                if self.same_bad_len_counter >= MAX_BAD_COUNTER {
-                    log::info!(
-                        "{} times encoding len is {}, switch",
-                        self.same_bad_len_counter,
-                        self.last_frame_len
-                    );
-                    bail!(crate::codec::ENCODE_NEED_SWITCH);
-                }
-            } else {
-                self.same_bad_len_counter = 0;
-            }
-            self.last_frame_len = this_frame_len;
             let frames = EncodedVideoFrames {
                 frames: frames.into(),
                 ..Default::default()
@@ -242,6 +235,7 @@ impl VRamEncoder {
         let v: Vec<_> = crate::hwcodec::HwCodecConfig::get()
             .vram_encode
             .drain(..)
+            .filter(|c| c.driver == Driver::FFMPEG)
             .filter(|c| c.data_format == data_format)
             .collect();
         if crate::hwcodec::HwRamEncoder::try_get(format).is_some() {
@@ -272,14 +266,21 @@ impl VRamEncoder {
         }
     }
 
-    pub fn encode(&mut self, texture: *mut c_void, ms: i64) -> ResultType<Vec<EncodeFrame>> {
+    pub fn encode(
+        &mut self,
+        texture: *mut c_void,
+        ms: i64,
+    ) -> ResultType<std::vec::Drain<'_, EncodeFrame>> {
         match self.encoder.encode(texture, ms) {
-            Ok(v) => {
-                let mut data = Vec::<EncodeFrame>::new();
-                data.append(v);
-                Ok(data)
-            }
-            Err(_) => Ok(Vec::<EncodeFrame>::new()),
+            Ok(frames) => Ok(frames.drain(..)),
+            Err(code) => Err(anyhow!("VRAM encode failed: {}", code)),
+        }
+    }
+
+    fn encode_repeat(&mut self, ms: i64) -> ResultType<std::vec::Drain<'_, EncodeFrame>> {
+        match self.encoder.encode_repeat(ms) {
+            Ok(frames) => Ok(frames.drain(..)),
+            Err(code) => Err(anyhow!("VRAM repeat encode failed: {}", code)),
         }
     }
 
@@ -287,16 +288,25 @@ impl VRamEncoder {
         crate::hwcodec::HwRamEncoder::calc_bitrate(width, height, ratio, fmt == DataFormat::H264)
     }
 
-    pub fn set_not_use(display: usize, not_use: bool) {
-        log::info!("set display#{display} not use vram encode to {not_use}");
-        ENOCDE_NOT_USE.lock().unwrap().insert(display, not_use);
+    pub fn set_not_use(video_service_name: String, not_use: bool) {
+        log::info!("set {video_service_name} not use vram encode to {not_use}");
+        ENOCDE_NOT_USE
+            .lock()
+            .unwrap()
+            .insert(video_service_name, not_use);
     }
 
-    pub fn set_fallback_gdi(display: usize, fallback: bool) {
+    pub fn set_fallback_gdi(video_service_name: String, fallback: bool) {
         if fallback {
-            FALLBACK_GDI_DISPLAYS.lock().unwrap().insert(display);
+            FALLBACK_GDI_DISPLAYS
+                .lock()
+                .unwrap()
+                .insert(video_service_name);
         } else {
-            FALLBACK_GDI_DISPLAYS.lock().unwrap().remove(&display);
+            FALLBACK_GDI_DISPLAYS
+                .lock()
+                .unwrap()
+                .remove(&video_service_name);
         }
     }
 }
@@ -329,6 +339,7 @@ impl VRamDecoder {
         crate::hwcodec::HwCodecConfig::get()
             .vram_decode
             .drain(..)
+            .filter(|c| c.driver == Driver::FFMPEG)
             .filter(|c| c.data_format == data_format && c.luid == luid && luid != 0)
             .collect()
     }
@@ -339,8 +350,10 @@ impl VRamDecoder {
         }
         let v = crate::hwcodec::HwCodecConfig::get().vram_decode;
         (
-            v.iter().any(|d| d.data_format == DataFormat::H264),
-            v.iter().any(|d| d.data_format == DataFormat::H265),
+            v.iter()
+                .any(|d| d.driver == Driver::FFMPEG && d.data_format == DataFormat::H264),
+            v.iter()
+                .any(|d| d.driver == Driver::FFMPEG && d.data_format == DataFormat::H265),
         )
     }
 
@@ -358,7 +371,7 @@ impl VRamDecoder {
             }
         }
     }
-    pub fn decode(&mut self, data: &[u8]) -> ResultType<Vec<VRamDecoderImage>> {
+    pub fn decode<'a>(&'a mut self, data: &[u8]) -> ResultType<Vec<VRamDecoderImage<'a>>> {
         match self.decoder.decode(data) {
             Ok(v) => Ok(v.iter().map(|f| VRamDecoderImage { frame: f }).collect()),
             Err(e) => Err(anyhow!(e)),
