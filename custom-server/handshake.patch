@@ -20,7 +20,7 @@ index 9c76f41..cb41c42 100644
 +}
 diff --git a/src/handshake.rs b/src/handshake.rs
 new file mode 100644
-index 0000000..028425c
+index 0000000..05d1f28
 --- /dev/null
 +++ b/src/handshake.rs
 @@ -0,0 +1,284 @@
@@ -53,9 +53,9 @@ index 0000000..028425c
 +    let encoded = std::fs::read_to_string(path)?;
 +    let bytes = base64::decode(encoded.trim())?;
 +    let sk = sign::SecretKey::from_slice(&bytes).context("invalid handshake signing key")?;
-+    if let Ok(expected) = std::env::var("RUSTDESK_ADDITIONAL_KEY") {
++    if let Ok(expected) = std::env::var("RUSTDESK_HANDSHAKE_PUBLIC_KEY") {
 +        if base64::encode(sk.public_key().0) != expected {
-+            bail!("handshake signing key does not match the additional public key");
++            bail!("handshake signing key does not match the configured handshake public key");
 +        }
 +    }
 +    SIGNER
